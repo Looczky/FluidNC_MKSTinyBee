@@ -3,8 +3,17 @@
 Uruchom z katalogu projektu:
 
 ```bash
-tools/run_gamepad_xy.sh
+tools/run_gamepad_xy.sh          # Linux
 ```
+
+```powershell
+.\tools\run_gamepad_xy.ps1       # Windows (PowerShell)
+```
+
+Port płytki jest wykrywany automatycznie (CH340, USB VID `1a86`): na Linuksie
+`/dev/serial/by-id/usb-1a86_*`, na Windowsie odpowiedni `COMx`. Gdy podłączonych
+jest kilka takich adapterów, wskaż port ręcznie: `--port COM5` lub
+`--port /dev/ttyUSB0`.
 
 Lewy drążek poziomo steruje X, prawy poziomo steruje Y. Wychylenie określa
 prędkość. Wycentruj oba drążki po uruchomieniu, aby uzbroić sterowanie.
@@ -43,20 +52,53 @@ tools/run_gamepad_xy.sh --monitor
 Monitor pokazuje surowe osie i przyciski pada, bez odczytywania konfiguracji
 płytki. `--duration 10` ogranicza czas dowolnego trybu.
 
+## Test silników bez pada
+
+Gdy pad steruje, a silniki stoją, uruchom:
+
+```bash
+.venv-gamepad/bin/python tools/motor_test_xy.py              # Linux
+.venv-gamepad\Scripts\python tools\motor_test_xy.py          # Windows
+```
+
+Skrypt wykonuje jog X i Y tam i z powrotem i pokazuje `MPos`. Długość, prędkość,
+osie i liczbę powtórzeń zmienisz w stałych `TEST_*` na początku pliku albo
+opcjami `--distance`, `--feed`, `--axes`, `--repeats`, `--port`. Jeśli `MPos` się zmienia, a silnik
+stoi, problem jest sprzętowy: brak zasilania silników (samo USB zasila tylko
+ESP32), sterowniki, kable silników lub prąd sterownika (Vref).
+
 ## Ustawienia samego pada
 
 Na początku `gamepad_motor_controller_xy.py` pozostają:
 
 | Zmienna | Znaczenie |
 | --- | --- |
-| `X_STICK_AXIS`, `Y_STICK_AXIS` | Indeksy osi pada |
+| `X_STICK_AXIS`, `Y_STICK_AXIS` | Indeksy osi pada; `None` = autowykrycie (patrz niżej) |
 | `INVERT_X_STICK`, `INVERT_Y_STICK` | Odwrócenie kierunku danego drążka |
 | `DEADZONE` | Martwa strefa wokół środka |
 | `EXPO` | Krzywa reakcji; 1 liniowo, większa = dokładniej przy środku |
 | `ENABLE_BUTTON` | Opcjonalny przycisk, który trzeba trzymać; `None` wyłącza wymaganie |
-| `STOP_BUTTON` | Przycisk anulowania jog |
+| `STOP_BUTTON` | Przycisk anulowania jog; `None` = autowykrycie (kółko PS5 / B Xbox) |
 | `MAX_QUEUED_SEGMENTS`, `SEGMENT_SECONDS` | Głębokość kolejki i długość odcinka |
-| `SERIAL_PORT`, `BAUD_RATE` | Port TinyBee i szybkość transmisji |
+| `SERIAL_PORT`, `BAUD_RATE` | Port TinyBee (`None` = autowykrywanie CH340, można nadpisać `--port COM5`) i szybkość transmisji |
+
+Skrypt obsługuje pady PS5 (DualSense) i Xbox na Linuksie i Windowsie.
+Typ pada jest rozpoznawany po nazwie, a `GAMEPAD_INDEX = None` wybiera pierwszy
+rozpoznany pad. Indeksy osi i przycisku stop pochodzą z mapowania SDL
+GameController, które zna surowy układ pada na danym systemie. Gdy SDL nie zna
+pada, używany jest zapasowy układ dla pary system + pad:
+
+| System | Pad | X | Y | Stop |
+| --- | --- | --- | --- | --- |
+| Linux | PS5 (hid-playstation) | 0 | 3 | 1 (kółko) |
+| Linux | Xbox (xpad) | 0 | 3 | 1 (B) |
+| Windows | PS5 (HIDAPI SDL) | 0 | 2 | 1 (kółko) |
+| Windows | Xbox (XInput) | 0 | 3 | 1 (B) |
+
+Nieznany pad dostaje pierwotny układ skryptu (0, 3, stop 1). Na Windowsie
+skrypt wyłącza RawInput (`SDL_JOYSTICK_RAWINPUT=0`), bo bez okna pad zwracałby
+same zera. Przy starcie wypisywany jest wykryty typ i źródło mapowania.
+Ręcznie ustawione `X_STICK_AXIS`, `Y_STICK_AXIS`, `STOP_BUTTON` mają pierwszeństwo.
 
 ## Zachowanie ruchu
 
@@ -83,11 +125,24 @@ Kroki/mm w tym profilu są diagnostyczne, bez kalibracji mechaniki.
 
 ## Instalacja i testy
 
+Linux:
+
 ```bash
 python3 -m venv .venv-gamepad
 .venv-gamepad/bin/python -m pip install -r tools/requirements-gamepad.txt
 .venv-gamepad/bin/python -m unittest discover -s tools/testing -p test_gamepad_xy.py -v
 ```
+
+Windows (PowerShell):
+
+```powershell
+py -3 -m venv .venv-gamepad
+.venv-gamepad\Scripts\python -m pip install -r tools\requirements-gamepad.txt
+.venv-gamepad\Scripts\python -m unittest discover -s tools\testing -p test_gamepad_xy.py -v
+```
+
+Jeśli PowerShell blokuje skrypty `.ps1`, uruchom
+`.venv-gamepad\Scripts\python tools\gamepad_motor_controller_xy.py` bezpośrednio.
 
 Źródła protokołu: [jogging GRBL](https://github.com/gnea/grbl/blob/master/doc/markdown/jogging.md),
 lokalne `FluidNC/src/Jog.cpp`, `Planner.cpp`, `Report.cpp`.

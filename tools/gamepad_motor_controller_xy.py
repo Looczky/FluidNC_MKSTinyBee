@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""DualSense -> FluidNC XY. Konfiguracja poniżej; instrukcja: GAMEPAD-XY.md.
+"""Pad PS5 / Xbox -> FluidNC XY (Linux i Windows). Konfiguracja poniżej; instrukcja: GAMEPAD-XY.md.
 
 --monitor: tylko odczyt pada, bez otwierania portu płytki.
 --dry-run: drukowanie ruchów, bez otwierania portu płytki.
@@ -18,12 +18,42 @@ from typing import NamedTuple
 os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
 os.environ.setdefault("SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS", "1")
 
+class PadLayout(NamedTuple):
+    x_axis: int                  # lewy drążek, poziomo
+    y_axis: int                  # prawy drążek, poziomo
+    stop_button: int             # kółko (PS5) / B (Xbox)
+
+
+# Surowy układ zależy od systemu i sterownika, więc głównym źródłem jest mapowanie
+# SDL. Te układy są zapasowe, gdy SDL nie zna pada:
+# - Linux: sterowniki jądra hid-playstation / xpad (LX, LY, L2, RX, RY, R2),
+# - Windows: Xbox przez XInput (LX, LY, LT, RX, RY, RT),
+#            PS5 przez HIDAPI SDL (LX, LY, RX, RY, L2, R2).
+FALLBACK_LAYOUTS = {
+    ("linux", "PS5"): PadLayout(x_axis=0, y_axis=3, stop_button=1),
+    ("linux", "XBOX"): PadLayout(x_axis=0, y_axis=3, stop_button=1),
+    ("windows", "PS5"): PadLayout(x_axis=0, y_axis=2, stop_button=1),
+    ("windows", "XBOX"): PadLayout(x_axis=0, y_axis=3, stop_button=1),
+}
+DEFAULT_LAYOUT = PadLayout(x_axis=0, y_axis=3, stop_button=1)  # pierwotny układ skryptu
+# Kolejność ma znaczenie: "Xbox Wireless Controller" nie może trafić do PS5.
+PAD_NAME_PATTERNS = {
+    "XBOX": ("xbox", "x-box", "xinput", "microsoft"),
+    "PS5": ("dualsense", "ps5", "playstation", "sony", "wireless controller"),
+}
+
+
+def host_platform():
+    return "windows" if os.name == "nt" else "linux"
+
+
 # ---- USTAWIENIA DO EDYCJI ---------------------------------------------------
-SERIAL_PORT = "/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0"
+SERIAL_PORT = None               # None = autowykrywanie CH340 (Linux/Windows); np. "COM5"
+SERIAL_USB_VID = 0x1A86          # CH340 na MKS TinyBee
 BAUD_RATE = 115200
-GAMEPAD_INDEX = 0
-X_STICK_AXIS = 0                 # lewy drążek, poziomo
-Y_STICK_AXIS = 3                 # prawy drążek, poziomo (sprawdź --monitor)
+GAMEPAD_INDEX = None             # None = pierwszy rozpoznany pad (PS5/Xbox); albo numer z --monitor
+X_STICK_AXIS = None              # None = autowykrycie pada (PS5/Xbox); albo własny indeks z --monitor
+Y_STICK_AXIS = None              # None = autowykrycie pada (PS5/Xbox); albo własny indeks z --monitor
 INVERT_X_STICK = False
 INVERT_Y_STICK = False
 # Prędkości i przyspieszenia pochodzą z aktywnej konfiguracji FluidNC.
@@ -31,7 +61,7 @@ INVERT_Y_STICK = False
 OFFLINE_CONFIG = Path(__file__).resolve().parents[1] / "artifacts/mks-tinybee/config.xy-gamepad.yaml"
 DEADZONE = 0.08                  # 0..1, szum drążków
 EXPO = 1.8                      # 1 = liniowo; >1 = precyzja przy środku
-STOP_BUTTON = 1                 # kółko: anuluj jog; wymaga powrotu do środka
+STOP_BUTTON = None              # None = autowykrycie (kółko PS5 / B Xbox); jog cancel, wymaga powrotu do środka
 ENABLE_BUTTON = None            # np. 4 = wymagaj trzymania L1; None = bez
 SEGMENT_SECONDS = 0.04           # długość jednego odcinka ruchu
 MAX_QUEUED_SEGMENTS = 6          # krótka kolejka; zapas hamowania jest sprawdzany z limitów YAML
@@ -299,20 +329,93 @@ class Board:
             self.port.close()
 
 
-def get_pad(pygame):
-    if not os.environ.get("DISPLAY") and not os.environ.get("WAYLAND_DISPLAY"):
+def detect_pad_kind(name):
+    lowered = name.lower()
+    for kind, patterns in PAD_NAME_PATTERNS.items():
+        if any(pattern in lowered for pattern in patterns):
+            return kind
+    return None
+
+
+def sdl_mapping(pygame, index):
+    """Mapowanie SDL GameController: fizyczne drążki -> surowe indeksy na tym systemie."""
+    try:
+        from pygame._sdl2 import controller
+        controller.init()
+        if controller.is_controller(index):
+            return controller.Controller(index).get_mapping()
+    except (ImportError, pygame.error):
+        pass
+    return {}
+
+
+def mapped_index(mapping, name, prefix):
+    match = re.fullmatch(prefix + r"(\d+)", mapping.get(name, ""))
+    return int(match[1]) if match else None
+
+
+def resolve_layout(name, mapping, platform=None):
+    """Zwraca (typ pada, układ, źródło). Ręczne indeksy mają pierwszeństwo."""
+    platform = platform or host_platform()
+    kind = detect_pad_kind(name)
+    sdl = PadLayout(mapped_index(mapping, "leftx", "a"),
+                    mapped_index(mapping, "rightx", "a"),
+                    mapped_index(mapping, "b", "b"))
+    if None not in sdl:
+        base, source = sdl, "mapowanie SDL"
+    elif kind:
+        base, source = FALLBACK_LAYOUTS[(platform, kind)], f"zapasowy układ {kind}/{platform}"
+    else:
+        base, source = DEFAULT_LAYOUT, "domyślny układ (nieznany pad)"
+    manual = (X_STICK_AXIS, Y_STICK_AXIS, STOP_BUTTON)
+    layout = PadLayout(*(m if m is not None else b for m, b in zip(manual, base)))
+    if any(m is not None for m in manual):
+        source += " + ręczne ustawienia"
+    return kind or "nieznany", layout, source
+
+
+def configure_sdl():
+    """Ustawienia SDL zależne od systemu; muszą być przed pygame.display.init()."""
+    if host_platform() == "windows":
+        # Z RawInput pad pod sterownikiem "dummy" zwraca same zera.
+        # Bez niego Xbox idzie przez XInput/WGI, PS5 przez HIDAPI; oba działają bez okna.
+        os.environ.setdefault("SDL_JOYSTICK_RAWINPUT", "0")
         os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
+    elif not os.environ.get("DISPLAY") and not os.environ.get("WAYLAND_DISPLAY"):
+        os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
+
+
+def choose_pad_index(pygame):
+    """GAMEPAD_INDEX albo pierwszy rozpoznany pad (pomija np. touchpad/czujniki ruchu)."""
+    count = pygame.joystick.get_count()
+    if GAMEPAD_INDEX is not None:
+        if GAMEPAD_INDEX >= count:
+            raise RuntimeError(f"Brak pada o indeksie {GAMEPAD_INDEX} (wykryto {count}).")
+        return GAMEPAD_INDEX
+    if count == 0:
+        raise RuntimeError("Nie wykryto pada. Podłącz pada (PS5/Xbox) i spróbuj ponownie.")
+    for index in range(count):
+        if sdl_mapping(pygame, index) or detect_pad_kind(pygame.joystick.Joystick(index).get_name()):
+            return index
+    return 0
+
+
+def get_pad(pygame):
+    global X_STICK_AXIS, Y_STICK_AXIS, STOP_BUTTON
+    configure_sdl()
     pygame.display.init()  # kolejka zdarzeń SDL wymaga podsystemu video
     pygame.joystick.init()
-    if GAMEPAD_INDEX >= pygame.joystick.get_count():
-        raise RuntimeError("Nie wykryto pada. Podłącz DualSense i spróbuj ponownie.")
-    pad = pygame.joystick.Joystick(GAMEPAD_INDEX)
+    index = choose_pad_index(pygame)
+    pad = pygame.joystick.Joystick(index)
+    kind, layout, source = resolve_layout(pad.get_name(), sdl_mapping(pygame, index))
+    X_STICK_AXIS, Y_STICK_AXIS, STOP_BUTTON = layout
     if max(X_STICK_AXIS, Y_STICK_AXIS) >= pad.get_numaxes() or min(X_STICK_AXIS, Y_STICK_AXIS) < 0:
         raise ValueError("Indeks drążka poza zakresem; użyj --monitor.")
     for button in (STOP_BUTTON, ENABLE_BUTTON):
         if button is not None and not 0 <= button < pad.get_numbuttons():
             raise ValueError("Indeks przycisku poza zakresem.")
-    print(f"Pad [{GAMEPAD_INDEX}]: {pad.get_name()}, osi: {pad.get_numaxes()}, przycisków: {pad.get_numbuttons()}")
+    print(f"Pad [{index}]: {pad.get_name()}, osi: {pad.get_numaxes()}, przycisków: {pad.get_numbuttons()}")
+    print(f"Typ pada: {kind}; X = oś {X_STICK_AXIS}, Y = oś {Y_STICK_AXIS}, stop = przycisk {STOP_BUTTON} ({source})")
     return pad
 
 
@@ -371,8 +474,24 @@ def run(pygame, pad, board, duration, limits):
         time.sleep(POLL_SECONDS)
 
 
+def find_serial_port():
+    # Linux: stabilna nazwa by-id nie zmienia się przy przełączaniu USB (ttyUSB0/1).
+    by_id = sorted(Path("/dev/serial/by-id").glob(f"usb-{SERIAL_USB_VID:04x}_*"))
+    if len(by_id) == 1:
+        return str(by_id[0])
+    from serial.tools import list_ports
+    ports = [p for p in list_ports.comports() if p.vid == SERIAL_USB_VID]
+    if len(ports) == 1:
+        return ports[0].device
+    available = ", ".join(f"{p.device} ({p.description})" for p in list_ports.comports()) or "brak"
+    if not ports:
+        raise RuntimeError(f"nie znaleziono płytki (USB VID {SERIAL_USB_VID:04x}); dostępne porty: {available}; użyj --port")
+    raise RuntimeError(f"kilka pasujących portów: {available}; wskaż jeden przez --port")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--port", default=SERIAL_PORT, help="port płytki, np. COM5 lub /dev/ttyUSB0 (domyślnie autowykrywanie)")
     parser.add_argument("--monitor", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--config", type=Path, help="lokalny YAML, tylko z --dry-run")
@@ -386,7 +505,7 @@ def main():
     try:
         import pygame
     except ImportError:
-        parser.exit(1, "Brak zależności. Uruchom tools/run_gamepad_xy.sh\n")
+        parser.exit(1, "Brak zależności: pip install -r tools/requirements-gamepad.txt (instrukcja: tools/GAMEPAD-XY.md)\n")
     signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
     board = None
     result = 0
@@ -407,7 +526,9 @@ def main():
                 limits = load_yaml_limits(filename)
                 show_motion_limits(limits, filename)
             else:
-                board = Board(SERIAL_PORT, BAUD_RATE)
+                port = args.port or find_serial_port()
+                print(f"Port płytki: {port}")
+                board = Board(port, BAUD_RATE)
                 board.initialize()
                 limits = board.limits
             run(pygame, pad, board, args.duration, limits)
