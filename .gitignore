@@ -3,3 +3,11 @@
 .vscode/c_cpp_properties.json
 .vscode/launch.json
 .vscode/ipch
+
+# Local-only files
+artifacts/
+.vscode/
+.idea/
+__pycache__/
+*.pyc
+compile_commands.json
